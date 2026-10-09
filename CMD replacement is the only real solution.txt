@@ -1,0 +1,580 @@
+FUNCTIONAL SPECIFICATION
+CMD.EXE-COMPATIBLE COMMAND INTERPRETER
+Version 1.0
+Derived from publicly documented behavior only.
+No proprietary or leaked source was consulted.
+
+================================================================
+SECTION 1 - SCOPE AND PURPOSE
+================================================================
+
+1.1 Purpose
+This document specifies the behavior of a command interpreter compatible
+with Microsoft cmd.exe as observed on Windows 10 and Windows 11. The
+specification is written for a clean-room implementation. It describes
+observable behavior, not internal implementation.
+
+1.2 Goals
+- Accept and execute commands typed interactively.
+- Execute batch files (.bat, .cmd) with compatible syntax.
+- Provide cmd.exe-compatible built-in commands.
+- Launch external executables with correct environment, working
+  directory, and handle inheritance.
+- Solve the PATH length problem by constructing short, purpose-built
+  environment blocks per child process instead of inheriting one
+  global, bloated PATH.
+
+1.3 Non-Goals
+- Binary compatibility with cmd.exe internals.
+- Support for undocumented or obsolete behavior of Windows 9x.
+- GUI features. This is a console application.
+
+1.4 Target Platform
+Windows 10 and Windows 11, x64 and ARM64. Implementation language is
+not specified, but the reference implementation target is Delphi.
+
+================================================================
+SECTION 2 - ARCHITECTURE
+================================================================
+
+2.1 Components
+The interpreter consists of five subsystems:
+
+  A. Console I/O Layer      - reads keystrokes, renders the prompt and
+                              input line, handles editing keys.
+  B. Lexer and Parser       - tokenizes a command line into a command,
+                              arguments, redirections, and operators.
+  C. Expansion Engine       - performs variable, wildcard, and delayed
+                              expansion.
+  D. Executor               - decides between built-in and external
+                              command, manages redirection and pipes,
+                              invokes CreateProcess.
+  E. Environment Manager    - maintains the session environment, the
+                              current directory, and per-child
+                              environment blocks.
+
+2.2 Execution Model
+The shell runs a read-eval-print loop (REPL). Each iteration:
+  1. Render the prompt.
+  2. Read a logical line (which may span physical lines via ^ or
+     open quotes or parentheses).
+  3. Expand the line.
+  4. Parse into a command structure.
+  5. Execute the command structure.
+  6. Store the error level.
+  7. Repeat until EOF or exit.
+
+Batch files execute in a nested context. A batch file may call another
+batch file, which returns to the caller when the inner file ends.
+
+================================================================
+SECTION 3 - CONSOLE I/O LAYER
+================================================================
+
+3.1 Input
+Input MUST be read with ReadConsoleInput, not ReadLn.
+The input loop MUST handle:
+
+  - Printable characters: insert at cursor position.
+  - Backspace: delete character before cursor.
+  - Delete: delete character at cursor.
+  - Left/Right arrows: move cursor within the line.
+  - Home/End: move cursor to start/end of line.
+  - Up/Down arrows: navigate command history.
+  - Tab: trigger path completion for the token under the cursor.
+  - F7: display a selectable history list.
+  - F3: recall the previous command.
+  - F8: search history for a prefix.
+  - Ctrl+C: cancel the current input line and reset it.
+  - Ctrl+Break: cancel the running child process.
+  - Ctrl+Z then Enter: signal end of input (EOF).
+
+3.2 Line Wrapping
+When the input length exceeds the console width, the line MUST wrap
+visually while maintaining a single logical line in memory. The cursor
+position must be mapped correctly between logical and physical
+coordinates at all times.
+
+3.3 Output
+Output MUST be written with WriteConsoleW (or WriteConsoleOutputCharacterW
+for cursor-addressed writes). ANSI/VT sequences MUST be passed through
+to the console unchanged so that child programs can render colored output.
+
+3.4 History
+Maintain an in-memory command history. Persist it to a file if
+configured. F7 displays the history; F8 searches it; Up/Down navigate it.
+Consecutive duplicate entries SHOULD be collapsed.
+
+================================================================
+SECTION 4 - LEXER AND PARSER
+================================================================
+
+4.1 Token Types
+  - COMMAND       : the first token; built-in name or external path.
+  - ARGUMENT      : a whitespace-separated token, possibly quoted.
+  - REDIRECT_IN   : "<"
+  - REDIRECT_OUT  : ">"
+  - REDIRECT_APPEND : ">>"
+  - REDIRECT_ERR  : "2>"
+  - REDIRECT_ERR_APPEND : "2>>"
+  - MERGE_STDERR  : "2>&1"
+  - PIPE          : "|"
+  - SEPARATOR     : "&"
+  - COND_AND      : "&&"
+  - COND_OR       : "||"
+  - LPAREN        : "("
+  - RPAREN        : ")"
+
+4.2 Quoting Rules
+  - A double quote (") toggles the "in quotes" state.
+  - Inside quotes, whitespace and most special characters lose their
+    meaning.
+  - A caret (^) escapes the next character when outside quotes.
+  - Two consecutive quotes inside a quoted string ("") represent a
+    literal quote.
+  - Backslash (\) is NOT an escape character in cmd.exe syntax.
+  - Single quotes (') have no special meaning.
+
+4.3 Command Separators
+  &    Execute the left command, then unconditionally the right.
+  &&   Execute the right only if the left succeeded (errorlevel 0).
+  ||   Execute the right only if the left failed (errorlevel != 0).
+  |    Pipe the standard output of the left into the standard input
+       of the right.
+  A logical line may contain any number of these, evaluated left to right.
+
+4.4 Parentheses
+  ( )  Group commands. Used primarily with if and for. An open paren
+       starts a block that continues until the matching close paren.
+       Newlines inside a block are treated as separators.
+
+================================================================
+SECTION 5 - EXPANSION ENGINE
+================================================================
+
+5.1 Percent Expansion (immediate)
+  %VAR%        Expand to the value of environment variable VAR.
+  %VAR:~n%     Substring from offset n.
+  %VAR:~n,m%   Substring of length m starting at offset n.
+  %VAR:old=new% Replace old with new in the value.
+  %0 .. %9     Batch file arguments. %0 is the script name.
+  %*           All arguments as a single string.
+  %~1 .. %~9   Argument with surrounding quotes removed.
+  %%~f1        Full path of argument 1 (used inside for).
+  %%~d1        Drive letter only.
+  %%~p1        Path only.
+  %%~n1        File name only.
+  %%~x1        Extension only.
+  %%           A literal percent sign inside a batch file.
+  Expansion is performed at parse time, before the command runs.
+  Inside a for loop body, %VAR% is expanded once, at loop entry, not
+  per iteration. This is a documented and commonly relied-upon behavior.
+
+5.2 Delayed Expansion (!)
+  Enabled by setlocal enabledelayedexpansion.
+  !VAR!       Expand at execution time, once per loop iteration.
+  This is required for setting and reading variables inside a for loop.
+  If delayed expansion is enabled, the caret (^) escapes a literal !
+  in addition to its other roles.
+
+5.3 Caret Escaping
+  ^X          Produces a literal X, preventing X from being treated
+              as a special character.
+  ^^          Produces a literal caret.
+  ^ at end of line  Continues the line on the next physical line.
+
+5.4 Wildcard Expansion
+  *  and  ?   Are NOT expanded by the shell for ordinary commands.
+              They are passed through to the program unchanged. The
+              program itself (e.g. dir, copy) performs the expansion.
+  Exception: inside a for loop, the loop body expands wildcards.
+
+================================================================
+SECTION 6 - BATCH FILE PROCESSING
+================================================================
+
+6.1 Invocation
+  A batch file is invoked by naming it, or by call name.bat [args].
+  Without call, invoking a batch file transfers control permanently
+  (the caller does not resume). With call, control returns when the
+  inner file finishes.
+
+6.2 Parsing
+  The batch file is read one logical line at a time. A logical line
+  may be continued with ^, or may span multiple physical lines inside
+  parentheses.
+
+6.3 Labels and goto
+  :label      Defines a label. Labels are ignored during normal
+              sequential execution.
+  goto label  Transfers control to :label. If the label does not
+              exist, execution of the current batch file ends.
+
+6.4 call
+  call :label [args]     Calls a label as a subroutine. Control
+                         returns at the end of the file or at an
+                         explicit goto :eof.
+  call other.bat [args]  Invokes another batch file as a nested
+                         batch context.
+  Inside the called context, %1 .. %9 refer to the new arguments,
+  and the previous values are restored on return.
+
+6.5 Shift
+  shift      Discards %0 and shifts %1 into %0, %2 into %1, etc.
+  shift /n   Shifts starting at position n.
+
+6.6 setlocal and endlocal
+  setlocal   Pushes the current environment (all variables), the
+             current directory, and the current drive onto a stack.
+  endlocal   Pops the stack, restoring all three.
+  setlocal enabledelayedexpansion  Also enables ! expansion.
+  setlocal enabledextensions       Enables command extensions.
+  endlocal is executed implicitly at the end of a batch file if no
+  explicit endlocal is present. The stack depth MUST be limited, and
+  exceeding it MUST produce an error.
+
+6.7 Error levels
+  After each command, the error level is set:
+  - 0 on success
+  - non-zero on failure (command-specific)
+  if errorlevel n  tests whether errorlevel >= n.
+  if not errorlevel n  tests whether errorlevel < n.
+  %errorlevel%  Expands to the current errorlevel as a string.
+
+================================================================
+SECTION 7 - BUILT-IN COMMANDS
+================================================================
+
+7.1 Directory and file
+  dir [path] [/a] [/b] [/o] [/s] [/w] [/p]  List directory contents.
+  cd [/d] [path]    Change directory. /d also changes the drive.
+  chdir [path]      Synonym for cd.
+  md [path]         Create directory.
+  mkdir [path]      Synonym for md.
+  rd [/s] [/q] [path]  Remove directory.
+  rmdir             Synonym for rd.
+  del [/p] [/f] [/s] [/q] [files]  Delete files.
+  erase             Synonym for del.
+  copy [/y] [/v] src dst  Copy files.
+  xcopy [/s] [/e] [/i] [/y] src dst  Extended copy.
+  move [/y] src dst Move or rename files.
+  ren src dst       Rename a file.
+  rename            Synonym for ren.
+  type file         Print a file to standard output.
+  more < file       Page through input.
+
+7.2 Environment and shell
+  set [var[=value]]    Display or set a variable.
+  set /a expr          Evaluate an arithmetic expression.
+  set /p var=prompt    Read a line from stdin into var.
+  path [dirs]          Display or set the PATH variable.
+  prompt [text]        Set the prompt. Supports $P $G $T $D etc.
+  title [text]         Set the console window title.
+  color [attr]         Set console foreground/background color.
+  cls                  Clear the screen.
+  ver                  Print the Windows version.
+  vol [drive]          Print the volume label.
+  date [/t] [date]     Display or set the date.
+  time [/t] [time]     Display or set the time.
+  pause                Wait for a key press.
+  exit [/b] [code]     Exit the shell (/b exits only the batch file).
+  echo [on|off|text]   Display text or toggle command echoing.
+  shift                See 6.5.
+  call                 See 6.4.
+  goto                 See 6.3.
+  start [options] cmd  Start a separate window or process.
+
+7.3 Conditional and loop
+  if [not] errorlevel n cmd
+  if [not] exist file cmd
+  if [not] "str1"=="str2" cmd
+  if [/i] [not] "s1" cmpop "s2" cmd   where cmp is one of
+      equ neq lss leq gtr geq, optionally case-insensitive with /i.
+  if defined var cmd
+  else  is supported on the same line as if, or on the next line
+        immediately following the if command.
+
+  for %v in (set) do cmd
+  for /d %v in (pattern) do cmd
+  for /r [[drive:]path] %v in (set) do cmd
+  for /l %v in (start,step,end) do cmd
+  for /f ["options"] %v in (set) do cmd
+      options: eol=c  skip=n  delims=x  tokens=...  usebackq
+  Inside a batch file, the loop variable is written %%v.
+
+7.4 File associations and types
+  assoc [.ext[=[type]]]   Display or set file associations.
+  ftype [type[=[cmd]]]    Display or set file type commands.
+
+7.5 Comment and no-op
+  rem comment text     A comment.
+  ::comment text       An alternative comment form, technically a
+                       malformed label, but universally treated as a
+                       comment.
+
+================================================================
+SECTION 8 - EXTERNAL COMMAND EXECUTION
+================================================================
+
+8.1 Resolution Order
+  When the command is not a built-in, resolve the executable name in
+  this order:
+    1. The current directory.
+    2. Each directory in PATH, in order.
+    3. If the name has no extension, try .com, then .exe, then .bat,
+       then .cmd, in that order within each directory.
+  Extensions may be overridden by the PATHEXT variable.
+
+8.2 Process Creation
+  External commands MUST be launched with CreateProcessW.
+  The interpreter MUST:
+    - Build an explicit environment block for the child (see 8.4).
+    - Pass the current directory of the shell as lpCurrentDirectory.
+    - Inherit standard input, output, and error handles so that
+      redirection and pipes work naturally.
+    - Wait for the process to finish unless start or a background
+      operator was used.
+    - Set the errorlevel from the process exit code.
+
+8.3 Redirection
+  > file       Redirect stdout to file, truncating.
+  >> file      Redirect stdout to file, appending.
+  < file       Redirect stdin from file.
+  2> file      Redirect stderr.
+  2>&1         Duplicate stdout handle onto stderr.
+  &> file      Redirect both stdout and stderr.
+  Redirection is implemented by replacing the standard handles in
+  the STARTUPINFO passed to CreateProcess. The shell opens the file
+  with CreateFile and passes the resulting handle as hStdOutput or
+  hStdInput. The handle MUST be inheritable, and the child MUST be
+  created with bInheritHandles = TRUE.
+
+8.4 Environment Block Construction  (CORE FEATURE)
+  The shell MUST NOT pass its own environment block directly to the
+  child. Instead, for every child process, the shell MUST build a
+  fresh environment block as follows:
+
+    1. Start from the shell's session environment.
+    2. Replace the PATH variable with the session's effective PATH,
+       which is the short, managed PATH defined for the current
+       session or project (see Section 10).
+    3. Remove any variables marked as session-local.
+    4. Serialize the result as a sequence of null-terminated
+       "NAME=VALUE" strings, ending with an extra null character.
+
+  The serialized block is passed as lpEnvironment to CreateProcess.
+  Because the block is built per child and the PATH inside it is
+  controlled, the 4095-character registry limit and the 8191-character
+  cmd.exe limit are never reached. The child process sees only the
+  short PATH the shell chose to give it.
+
+8.5 Pipes
+  A pipe between two commands is implemented by creating an anonymous
+  pipe with CreatePipe, then launching the left command with its
+  stdout set to the write end of the pipe, and the right command
+  with its stdin set to the read end. The shell MUST close its own
+  copies of both ends after both children are started, or the pipe
+  will not signal end-of-file correctly. All processes in a pipeline
+  MUST run concurrently, not sequentially.
+
+================================================================
+SECTION 9 - ENVIRONMENT MANAGER
+================================================================
+
+9.1 Session Environment
+  The shell maintains an in-memory environment block for the current
+  session. set modifies this block. Child processes receive a copy.
+
+9.2 Effective PATH
+  The session's effective PATH is not the system PATH. It is the
+  short, managed PATH chosen for the current session or project. The
+  shell computes it at startup from:
+    - A base PATH containing only the shell itself and the system
+      directories required for basic operation.
+    - Zero or more per-project PATH entries loaded from a project
+      configuration file.
+  The shell MUST provide a command to display and modify the
+  effective PATH within the session.
+
+9.3 Project Configuration
+  When the shell starts in a directory containing a project marker
+  file (for example .cmdenv), the shell loads the file and applies
+  its PATH additions to the session. This is the cmd.exe equivalent
+  of direnv. Different projects therefore receive different, short
+  PATH values without ever modifying the global system PATH.
+
+9.4 Persistence
+  Changes to the session environment are discarded when the shell
+  exits, unless the user explicitly saves them. This preserves the
+  invariant that the global system PATH is never modified by normal
+  shell use.
+
+================================================================
+SECTION 10 - THE PATH PROBLEM AND ITS RESOLUTION
+================================================================
+
+10.1 Statement of the Problem
+  The global PATH variable is stored in the registry and truncated
+  at 4095 characters. The cmd.exe process additionally ignores any
+  inherited environment variable longer than 8191 characters after
+  expansion. As software is installed, PATH grows until one of these
+  limits is reached, at which point commands stop being found.
+  Variable substitution with %VAR% does not help because expansion
+  happens before the length check in cmd.exe.
+
+10.2 Resolution Adopted by This Specification
+  The shell never relies on a single global PATH. Instead:
+    - The shell's own PATH is short and managed.
+    - Each child process receives an explicitly constructed
+      environment block with a short, session-appropriate PATH.
+    - Per-project PATH additions live in project configuration, not
+      in the global variable.
+  The global PATH can therefore remain small indefinitely. The
+  limits are never approached because the shell never lets a child
+  inherit a bloated PATH.
+
+10.3 Optional Integration with App Paths and Aliases
+  The shell MAY additionally resolve command names through the
+  registry App Paths key for GUI-launch semantics, and MAY expose
+  Store App Execution Aliases. These are conveniences and are not
+  required for the core PATH solution.
+
+================================================================
+SECTION 11 - ERROR HANDLING AND DIAGNOSTICS
+================================================================
+
+11.1 Error Messages
+  Error messages SHOULD match cmd.exe text where compatibility
+  matters, and MAY be extended with additional detail. Each error
+  sets a non-zero errorlevel.
+
+11.2 Command Not Found
+  When a command cannot be resolved, print:
+    'name' is not recognized as an internal or external command,
+    operable program or batch file.
+  and set errorlevel to 9009.
+
+11.3 Missing Operand
+  When a required argument is missing, print the command's usage
+  line and set a non-zero errorlevel.
+
+================================================================
+SECTION 12 - COMPATIBILITY NOTES AND KNOWN PITFALLS
+================================================================
+
+12.1 Percent Expansion Timing
+  Inside for loops, %VAR% is expanded once at loop entry. This is
+  counter-intuitive but is the documented and depended-upon behavior.
+  Delayed expansion with !VAR! is provided to work around it.
+
+12.2 Caret Escaping Inside Quotes
+  Caret behaves differently inside and outside quotes. Implementers
+  must test exhaustively. The exact rules are:
+    - Outside quotes, ^ escapes the next character.
+    - Inside quotes, ^ is literal except before a quote or before !.
+    - A ^ at end of line continues the line.
+
+12.3 Errorlevel Semantics
+  if errorlevel n tests >= n, not == n. This is a frequent source
+  of bugs in scripts and must be reproduced exactly.
+
+12.4 setlocal / endlocal Nesting
+  The stack depth of setlocal must be finite and must be enforced.
+  Exceeding it must produce an error, not a crash or silent
+  corruption.
+
+12.5 for /f Tokenizer
+  The for /f parser is the single most complex part of the spec.
+  It must handle:
+    - Custom delimiters via delims=
+    - Line skipping via skip=
+    - End-of-line comment characters via eol=
+    - Token selection and ranges via tokens=
+    - Backquote command execution via usebackq
+    - Quoted file names
+    - The implicit stripping of leading delimiters
+  Implementers should build a dedicated test corpus covering every
+  combination before claiming compatibility.
+
+12.6 Wildcard Expansion
+  Ordinary commands do not expand wildcards. Only for loops and the
+  file built-ins do. Passing "*.txt" to an external program must
+  pass the literal string, not a file list.
+
+================================================================
+SECTION 13 - TESTING STRATEGY
+================================================================
+
+13.1 Unit Tests
+  - Lexer and parser: every token type and quoting combination.
+  - Expansion engine: every form of %VAR% substitution.
+  - Built-ins: each command with each documented switch.
+
+13.2 Integration Tests
+  - Batch files exercising goto, call, setlocal, and nested loops.
+  - Pipelines with multiple stages.
+  - Redirection combinations including 2>&1.
+  - Environment inheritance with a deliberately long PATH.
+
+13.3 Regression Corpus
+  - A set of real-world batch files from public sources, run under
+    both cmd.exe and the new shell, with output compared byte for
+    byte.
+
+13.4 PATH Stress Test
+  - Construct a session with a PATH of 100,000 characters.
+  - Verify that child processes receive only the short managed PATH
+    and that no command fails to launch.
+
+================================================================
+SECTION 14 - IMPLEMENTATION GUIDANCE (DELPHI)
+================================================================
+
+14.1 Project Type
+  Console application. {$APPTYPE CONSOLE}. No VCL or FMX.
+
+14.2 Key Units
+  Winapi.Windows         - CreateProcess, console APIs, handles
+  Winapi.Console         - console mode and screen buffer
+  System.SysUtils        - string handling
+  System.Generics.Collections - TDictionary for environment and history
+  System.Classes         - TStringList for line buffers
+
+14.3 Key Data Structures
+  TEnvironment = TDictionary<string, string>  (case-insensitive keys)
+  THistory     = TList<string>
+  TCommand     = record with command, args, redirections, operators
+  TSession     = record holding environment, cwd, drive, errorlevel,
+                         setlocal stack, batch context stack
+
+14.4 Concurrency
+  Pipes require concurrent execution of both sides. Use threads or
+  overlapped I/O. Do not serialize pipeline stages.
+
+14.5 Serialization of the Environment Block
+  See 8.4. The block must be a sequence of null-terminated strings,
+  each of the form NAME=VALUE, terminated by an extra null. It must
+  be allocated with GetMem and freed with FreeMem. Pass it to
+  CreateProcessW as lpEnvironment.
+
+================================================================
+SECTION 15 - ACCEPTANCE CRITERIA
+================================================================
+
+The implementation is considered complete when:
+
+  1. It executes interactive commands with correct parsing and
+     expansion.
+  2. It executes batch files with goto, call, setlocal, if, and
+     all four variants of for.
+  3. It implements every built-in in Section 7.
+  4. It correctly implements redirection, pipes, and the && || &
+     operators.
+  5. It launches external commands with an explicitly constructed,
+     short environment block.
+  6. It survives the PATH stress test in 13.4.
+  7. Its output matches cmd.exe byte for byte on the regression
+     corpus in 13.3, except where this specification explicitly
+     extends behavior.
+
+END OF SPECIFICATION
